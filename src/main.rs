@@ -16,6 +16,7 @@ use solana_vntr_sniper::{
         sniper_bot::{start_target_wallet_monitoring, start_dex_monitoring, SniperConfig},
         swap::SwapProtocol,
     },
+    poller::{start_rpc_polling_service, PollingServiceConfig},
     library::{ 
         cache_maintenance, 
         blockhash_processor::BlockhashProcessor,
@@ -33,6 +34,7 @@ use colored::Colorize;
 use spl_token::instruction::sync_native;
 use spl_token::ui_amount_to_amount;
 use spl_associated_token_account::get_associated_token_address;
+use std::time::Duration;
 
 /// Initialize the wallet token account list by fetching all token accounts owned by the wallet
 async fn initialize_token_account_list(config: &Config) {
@@ -650,6 +652,35 @@ async fn main() {
         excluded_addresses,
         protocol_preference,
     };
+
+    let rpc_polling_enabled = std::env::var("RPC_POLLING_ENABLED")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false);
+    let rpc_poll_interval_ms = std::env::var("RPC_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300);
+    let rpc_poll_max_signatures = std::env::var("RPC_POLL_MAX_SIGNATURES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(20);
+    let rpc_poll_cache_size = std::env::var("RPC_POLL_CACHE_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10_000);
+    let rpc_poll_max_concurrent = std::env::var("RPC_POLL_MAX_CONCURRENT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(5);
+    let rpc_poll_state_path = std::env::var("RPC_POLL_STATE_PATH").ok();
+    let rpc_polling_config = PollingServiceConfig {
+        poll_interval: Duration::from_millis(rpc_poll_interval_ms),
+        max_signatures: rpc_poll_max_signatures,
+        cache_size: rpc_poll_cache_size,
+        max_concurrent: rpc_poll_max_concurrent,
+        state_path: rpc_poll_state_path.clone(),
+    };
     
     // Run both monitoring functions simultaneously
     println!("🚀 Starting both monitoring systems simultaneously...");
@@ -664,6 +695,46 @@ async fn main() {
             }
         }
     });
+
+    let rpc_polling_handle = if rpc_polling_enabled {
+        let app_state = config.app_state.clone();
+        let addresses = target_addresses.clone();
+        let polling_config = rpc_polling_config.clone();
+        println!(
+            "🔎 RPC polling enabled: interval={}ms max_signatures={} cache_size={} max_concurrent={} state_path={}",
+            rpc_poll_interval_ms, rpc_poll_max_signatures, rpc_poll_cache_size, rpc_poll_max_concurrent
+            , rpc_poll_state_path.clone().unwrap_or_else(|| "none".to_string())
+        );
+        Some(tokio::spawn(async move {
+            let mut handles = Vec::new();
+            for address in addresses {
+                let app_state = app_state.clone();
+                let polling_config = polling_config.clone();
+                let pubkey = match Pubkey::from_str(&address) {
+                    Ok(pubkey) => pubkey,
+                    Err(err) => {
+                        eprintln!("Invalid COPY_TRADING_TARGET_ADDRESS {}: {}", address, err);
+                        continue;
+                    }
+                };
+                handles.push(tokio::spawn(async move {
+                    if let Err(err) =
+                        start_rpc_polling_service(app_state, pubkey, polling_config).await
+                    {
+                        eprintln!("RPC polling error: {}", err);
+                    }
+                }));
+            }
+
+            for handle in handles {
+                if let Err(err) = handle.await {
+                    eprintln!("RPC polling task failed: {}", err);
+                }
+            }
+        }))
+    } else {
+        None
+    };
     
     let dex_monitoring_handle = tokio::spawn({
         let config = sniper_config;
@@ -677,8 +748,14 @@ async fn main() {
     
     // Wait for both tasks to complete (or error)
     println!("⏳ Waiting for monitoring tasks to complete...");
-    tokio::try_join!(target_monitoring_handle, dex_monitoring_handle)
-        .map(|_| println!("🎯 Both monitoring systems have completed"))
-        .unwrap_or_else(|_| println!("⚠️  One or both monitoring systems encountered errors"));
+    if let Some(rpc_polling_handle) = rpc_polling_handle {
+        tokio::try_join!(target_monitoring_handle, dex_monitoring_handle, rpc_polling_handle)
+            .map(|_| println!("🎯 All monitoring systems have completed"))
+            .unwrap_or_else(|_| println!("⚠️  One or more monitoring systems encountered errors"));
+    } else {
+        tokio::try_join!(target_monitoring_handle, dex_monitoring_handle)
+            .map(|_| println!("🎯 Both monitoring systems have completed"))
+            .unwrap_or_else(|_| println!("⚠️  One or both monitoring systems encountered errors"));
+    }
 
 }
