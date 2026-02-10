@@ -6,7 +6,7 @@ use anchor_client::solana_sdk::signature::Signature;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::GetConfirmedSignaturesForAddress2Config;
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use std::str::FromStr;
 
@@ -86,8 +86,11 @@ pub async fn start_rpc_polling_service(
             cache.mark_seen(status.signature.clone());
         }
 
+        let rpc_client = app_state.rpc_nonblocking_client.clone();
         stream::iter(ordered_signatures)
-            .for_each_concurrent(config.max_concurrent, |status| async move {
+            .for_each_concurrent(config.max_concurrent, move |status| {
+                let rpc_client = rpc_client.clone();
+                async move {
                 let signature_string = status.signature.clone();
                 let slot = status.slot;
                 let signature = match Signature::from_str(&signature_string) {
@@ -98,7 +101,7 @@ pub async fn start_rpc_polling_service(
                     }
                 };
 
-                match fetch_transaction(&app_state.rpc_nonblocking_client, &signature).await {
+                match fetch_transaction(&rpc_client, &signature).await {
                     Ok(transaction) => {
                         if let Some(event) = parse_trade(signature, slot, &transaction) {
                             on_trade(&event);
@@ -107,6 +110,7 @@ pub async fn start_rpc_polling_service(
                     Err(err) => {
                         eprintln!("Failed to fetch transaction {}: {}", signature_string, err);
                     }
+                }
                 }
             })
             .await;

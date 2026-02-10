@@ -40,7 +40,10 @@ pub fn parse_trade(
 
     for post_balance in post_balances {
         let mint = post_balance.mint.clone();
-        let owner = post_balance.owner.clone()?;
+        let owner = match &post_balance.owner {
+            OptionSerializer::Some(owner) => owner.clone(),
+            _ => continue,
+        };
         let pre_balance = pre_balances
             .iter()
             .find(|balance| balance.owner == Some(owner.clone()) && balance.mint == mint);
